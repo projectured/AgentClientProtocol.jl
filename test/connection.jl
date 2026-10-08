@@ -156,8 +156,14 @@ end
         end
         @test internal.code == ACP.INTERNAL_ERROR
         @test !occursin("secret", internal.message)
-        # A request that the handler does not serve.
+        # A request that the handler does not serve, also without its required fields.
         @test failure(ACP.ListSessionsRequest()).code == ACP.METHOD_NOT_FOUND
+        unserved = try
+            send_request!(client, "session/set_mode", Dict(); timeout = 10)
+        catch exception
+            exception
+        end
+        @test unserved.code == ACP.METHOD_NOT_FOUND
         # A request without a required field.
         invalid = try
             send_request!(client, "session/prompt", Dict("sessionId" => "s"); timeout = 10)

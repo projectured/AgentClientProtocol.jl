@@ -452,8 +452,13 @@ function _answer_request!(connection::Connection, context::RequestContext, param
         result = if type === nothing
             answer_request(connection.handler, method, params, context)
         else
-            request = try
-                _check_required_fields(convert_from_json(type, params))
+            request = convert_from_json(type, params)
+            # A method that the handler does not serve gets "method not found",
+            # whatever its parameters are.
+            _is_request_served(connection.handler, typeof(request)) ||
+                throw(ProtocolException(METHOD_NOT_FOUND, "The method `$(method)` is not served."))
+            try
+                _check_required_fields(request)
             catch exception
                 exception isa ArgumentError || rethrow()
                 throw(ProtocolException(INVALID_PARAMS, sprint(showerror, exception)))
@@ -479,6 +484,12 @@ function _answer_request!(connection::Connection, context::RequestContext, param
     end
     nothing
 end
+
+# Whether the handler has a method of `answer_request` for a request of the type
+# `T` beside the default, which answers "method not found".
+_is_request_served(handler, ::Type{T}) where {T} =
+    which(answer_request, Tuple{typeof(handler),T,RequestContext}) !==
+    which(answer_request, Tuple{Any,ProtocolObject,Any})
 
 # The result of a request of the protocol: an empty object when the handler
 # gives `nothing` for a response type that is an object.
