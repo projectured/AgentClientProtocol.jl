@@ -1,0 +1,12 @@
+AgentClientProtocol.jl
+
+schema/schema.json is the v1 JSON schema of the Agent Client Protocol, release
+1.7.0, from the package @agentclientprotocol/sdk of the Agent Client Protocol
+project (https://github.com/agentclientprotocol/agent-client-protocol). It is
+under the Apache License, Version 2.0
+(https://www.apache.org/licenses/LICENSE-2.0). src/types.jl is generated from it
+by gen/generate.jl.
+
+test/recorded/claude-agent-acp-0.87.0.jsonl holds messages that a test client
+exchanged with the agent @agentclientprotocol/claude-agent-acp, version 0.87.0,
+which is under the Apache License, Version 2.0. The file holds no account data.
