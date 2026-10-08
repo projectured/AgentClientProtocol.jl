@@ -26,8 +26,16 @@ using JSON
 
 export ProtocolObject, get_json, convert_from_json, convert_to_json, read_json, write_json
 export get_method_name, get_response_type
+export PROTOCOL_VERSION, ProtocolException
+export Connection, open_connection, close_connection!, is_connection_open
+export OutgoingRequest, start_request!, wait_for_answer, send_request!, cancel_request!,
+       send_notification!
+export RequestContext, is_request_cancelled, add_cancel_callback!
+export ClientHandler, AgentHandler, answer_request, receive_notification, send_session_update!
 
 include("objects.jl")
 include("types.jl")
+include("connection.jl")
+include("handlers.jl")
 
 end # module AgentClientProtocol
