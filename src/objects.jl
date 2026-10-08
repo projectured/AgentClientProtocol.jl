@@ -169,22 +169,22 @@ function _read_meta(json::Dict{String,Any})
 end
 
 function _write_optional!(json::Dict{String,Any}, key::String, ::Type{T}, value) where {T}
-    value === nothing || (json[key] = _write_member(T, value))
+    value === nothing || (json[key] = _convert_member_to_json(T, value))
     nothing
 end
 
 # The plain JSON value of `value` in a field of the type `T`. A variant of a
 # tagged union gets its tag when `T` is the union, because the type of a variant
 # can also be the type of a field that is no union, where it has no tag.
-_write_member(::Type{T}, value) where {T} = convert_to_json(value)
-_write_member(::Type{Any}, value) = convert_to_json(value)
-_write_member(::Type{Union{Nothing,T}}, value) where {T} =
-    value === nothing ? nothing : _write_member(T, value)
-_write_member(::Type{Vector{T}}, value::AbstractVector) where {T} =
-    Any[_write_member(T, item) for item in value]
-_write_member(::Type{Dict{String,T}}, value::AbstractDict) where {T} =
-    Dict{String,Any}(String(key) => _write_member(T, item) for (key, item) in value)
-function _write_member(::Type{T}, value::ProtocolObject) where {T<:ProtocolObject}
+_convert_member_to_json(::Type{T}, value) where {T} = convert_to_json(value)
+_convert_member_to_json(::Type{Any}, value) = convert_to_json(value)
+_convert_member_to_json(::Type{Union{Nothing,T}}, value) where {T} =
+    value === nothing ? nothing : _convert_member_to_json(T, value)
+_convert_member_to_json(::Type{Vector{T}}, value::AbstractVector) where {T} =
+    Any[_convert_member_to_json(T, item) for item in value]
+_convert_member_to_json(::Type{Dict{String,T}}, value::AbstractDict) where {T} =
+    Dict{String,Any}(String(key) => _convert_member_to_json(T, item) for (key, item) in value)
+function _convert_member_to_json(::Type{T}, value::ProtocolObject) where {T<:ProtocolObject}
     json = get_json(value)
     tag = _find_variant_tag(T, typeof(value))
     (tag === nothing || haskey(json, first(tag))) && return json

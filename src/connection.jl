@@ -33,6 +33,7 @@ ProtocolException(code::Integer, message::AbstractString; data = nothing) =
 Base.showerror(io::IO, exception::ProtocolException) =
     print(io, "ProtocolException: ", exception.message, " (code ", exception.code, ")")
 
+
 """
     Connection
 
@@ -40,7 +41,7 @@ One side of a connection: the two streams, the requests that wait for an
 answer, the requests of the other side that wait for their answer, and the task
 that reads. [`open_connection`](@ref) makes one, and
 [`close_connection!`](@ref) ends it. `wait(connection)` waits until the other
-side closes its stream.
+side closes its stream or the connection closes.
 
 The handler of the connection answers what the other side sends: a
 [`ClientHandler`](@ref) on the client side, an [`AgentHandler`](@ref) on the
@@ -58,6 +59,8 @@ mutable struct Connection
     answering::Dict{Any,Any}
     next_id::Int
     is_closed::Bool
+    is_reader_done::Bool
+    ended::Base.Event
     reader::Union{Nothing,Task}
 end
 
@@ -80,7 +83,7 @@ function open_connection(handler, incoming::IO, outgoing::IO;
     connection = Connection(handler, incoming, outgoing, process,
                             process === nothing ? Int32(0) : Int32(getpid(process)),
                             ReentrantLock(), ReentrantLock(), Dict{Int,Channel{Dict{String,Any}}}(),
-                            Dict{Any,Any}(), 0, false, nothing)
+                            Dict{Any,Any}(), 0, false, false, Base.Event(), nothing)
     connection.reader = errormonitor(@async _read_messages(connection))
     connection
 end
@@ -112,11 +115,11 @@ end
 """
     is_connection_open(connection) -> Bool
 
-Whether the connection can carry a message: it is not closed, and the other
+Whether the connection can carry a request: it is not closed, and the other
 side did not close its stream.
 """
 is_connection_open(connection::Connection) =
-    !connection.is_closed && (connection.reader === nothing || !istaskdone(connection.reader))
+    lock(() -> !connection.is_closed && !connection.is_reader_done, connection.state_lock)
 
 """
     close_connection!(connection) -> connection
@@ -126,7 +129,8 @@ end of its input. A process that the connection started and that still runs
 after five seconds gets `SIGTERM`, and after two more seconds `SIGKILL`, sent to
 its whole process group. The group gets `SIGTERM` at the end in any case, so no
 child of the process lives on. Each request that waits for an answer throws a
-[`ProtocolException`](@ref).
+[`ProtocolException`](@ref), and each request of the other side that a handler
+still answers counts as withdrawn, so its cancel callbacks run.
 """
 function close_connection!(connection::Connection)
     was_closed = lock(connection.state_lock) do
@@ -151,7 +155,7 @@ function close_connection!(connection::Connection)
         end
         _signal_process_group!(connection, Base.SIGTERM)
     end
-    _fail_waiting_requests!(connection)
+    _end_exchange!(connection)
     connection
 end
 
@@ -160,11 +164,7 @@ end
 
 Wait until the other side closes its stream, or the connection closes.
 """
-function Base.wait(connection::Connection)
-    reader = connection.reader
-    reader === nothing || wait(reader)
-    nothing
-end
+Base.wait(connection::Connection) = (wait(connection.ended); nothing)
 
 # The process starts in a group of its own, so the group is the process and
 # every process that it started, and the group outlives a process whose children
@@ -179,12 +179,22 @@ function _signal_process_group!(connection::Connection, signal::Integer)
     nothing
 end
 
-function _fail_waiting_requests!(connection::Connection)
-    channels = lock(() -> collect(values(connection.waiting_answers)), connection.state_lock)
+# The end of the exchange, at a close or at the end of the reader: each request
+# that waits gets an error answer, each request of the other side counts as
+# withdrawn, and `wait(connection)` returns.
+function _end_exchange!(connection::Connection)
+    channels, ids = lock(connection.state_lock) do
+        channels = collect(values(connection.waiting_answers))
+        empty!(connection.waiting_answers)
+        channels, collect(keys(connection.answering))
+    end
     for channel in channels
-        isready(channel) || put!(channel, Dict{String,Any}("error" => Dict{String,Any}(
+        put!(channel, Dict{String,Any}("error" => Dict{String,Any}(
             "code" => INTERNAL_ERROR, "message" => "The connection closed before the answer came.")))
     end
+    foreach(id -> _withdraw_request!(connection, id), ids)
+    notify(connection.ended)
+    nothing
 end
 
 # --- Requests and notifications ----------------------------------------------
@@ -211,7 +221,8 @@ end
 Send a request, and do not wait for its answer. The first method takes a
 request type of the protocol, and its answer has the response type of the
 method. The second method sends any method, such as an extension method whose
-name starts with `_`, and its answer is a plain JSON value.
+name starts with `_`, and its answer is a plain JSON value. Throws a
+[`ProtocolException`](@ref) when the connection can carry no request.
 """
 start_request!(connection::Connection, request::ProtocolObject) =
     _start_request!(connection, get_method_name(typeof(request)), get_json(request),
@@ -223,20 +234,28 @@ start_request!(connection::Connection, method::AbstractString, params) =
 function _start_request!(connection::Connection, method::String, params, response_type::Type)
     answer = Channel{Dict{String,Any}}(1)
     id = lock(connection.state_lock) do
-        connection.is_closed && throw(ProtocolException(INTERNAL_ERROR, "The connection is closed."))
+        (connection.is_closed || connection.is_reader_done) &&
+            throw(ProtocolException(INTERNAL_ERROR, "The connection is closed."))
         connection.next_id += 1
         connection.waiting_answers[connection.next_id] = answer
         connection.next_id
     end
-    request = OutgoingRequest(connection, id, method, answer, response_type)
     try
-        _write_message!(connection, Dict{String,Any}(
-            "jsonrpc" => "2.0", "id" => id, "method" => method, "params" => params))
+        _write_message!(connection, _make_message(method, params; id))
     catch
-        _forget_request!(request)
+        lock(() -> delete!(connection.waiting_answers, id), connection.state_lock)
         rethrow()
     end
-    request
+    OutgoingRequest(connection, id, method, answer, response_type)
+end
+
+# A request or a notification. JSON-RPC allows no `params` that is `null`, so
+# `nothing` leaves the field out.
+function _make_message(method::String, params; id = nothing)
+    message = Dict{String,Any}("jsonrpc" => "2.0", "method" => method)
+    id === nothing || (message["id"] = id)
+    params === nothing || (message["params"] = params)
+    message
 end
 
 """
@@ -245,31 +264,29 @@ end
 Wait for the answer of a request, and return its result. Throws a
 [`ProtocolException`](@ref) for an error answer, or when the connection closes
 first. A finite `timeout`, in seconds, throws an error when no answer comes in
-time; the request then stays open on the other side.
+time; the request then stays open, and a later wait can still get its answer.
+A result `null` of a response type that is an object reads as an empty object.
 """
 function wait_for_answer(request::OutgoingRequest; timeout::Real = Inf)
-    try
-        if isfinite(timeout)
-            timedwait(() -> isready(request.answer), Float64(timeout); pollint = 0.05) === :ok ||
-                error("The answer of `$(request.method)` did not come in $(timeout) s.")
-        end
-        answer = take!(request.answer)
-        if haskey(answer, "error")
-            failure = answer["error"]
-            failure isa AbstractDict || (failure = Dict{String,Any}())
-            code = get(failure, "code", INTERNAL_ERROR)
-            throw(ProtocolException(code isa Integer ? Int(code) : INTERNAL_ERROR,
-                                    string(get(failure, "message", "The other side answered an error.")),
-                                    get(failure, "data", nothing)))
-        end
-        convert_from_json(request.response_type, get(answer, "result", nothing))
-    finally
-        _forget_request!(request)
+    if isfinite(timeout)
+        timedwait(() -> isready(request.answer), Float64(timeout); pollint = 0.05) === :ok ||
+            error("The answer of `$(request.method)` did not come in $(timeout) s.")
     end
+    answer = fetch(request.answer)
+    if haskey(answer, "error")
+        failure = answer["error"]
+        failure isa AbstractDict || (failure = Dict{String,Any}())
+        code = get(failure, "code", INTERNAL_ERROR)
+        throw(ProtocolException(code isa Integer && typemin(Int) <= code <= typemax(Int) ? Int(code) :
+                                    INTERNAL_ERROR,
+                                string(get(failure, "message", "The other side answered an error.")),
+                                get(failure, "data", nothing)))
+    end
+    result = get(answer, "result", nothing)
+    type = request.response_type
+    result === nothing && type <: ProtocolObject && !isabstracttype(type) && return type(Dict{String,Any}())
+    convert_from_json(type, result)
 end
-
-_forget_request!(request::OutgoingRequest) =
-    lock(() -> delete!(request.connection.waiting_answers, request.id), request.connection.state_lock)
 
 """
     send_request!(connection, request::ProtocolObject; timeout = Inf)
@@ -305,11 +322,12 @@ send_notification!(connection::Connection, notification::ProtocolObject) =
     send_notification!(connection, get_method_name(typeof(notification)), get_json(notification))
 
 send_notification!(connection::Connection, method::AbstractString, params) =
-    _write_message!(connection, Dict{String,Any}(
-        "jsonrpc" => "2.0", "method" => String(method), "params" => convert_to_json(params)))
+    _write_message!(connection, _make_message(String(method), convert_to_json(params)))
 
-function _write_message!(connection::Connection, message::Dict{String,Any})
-    text = JSON.json(message)
+_write_message!(connection::Connection, message::Dict{String,Any}) =
+    _write_line!(connection, JSON.json(message))
+
+function _write_line!(connection::Connection, text::String)
     lock(connection.write_lock) do
         connection.is_closed && throw(ProtocolException(INTERNAL_ERROR, "The connection is closed."))
         write(connection.outgoing, text, '\n')
@@ -339,7 +357,8 @@ end
 """
     is_request_cancelled(context::RequestContext) -> Bool
 
-Whether the other side withdrew the request with `\$/cancel_request`.
+Whether the other side withdrew the request with `\$/cancel_request`, or the
+connection ended before the answer.
 """
 is_request_cancelled(context::RequestContext) =
     lock(() -> context.is_cancelled, context.connection.state_lock)
@@ -347,9 +366,12 @@ is_request_cancelled(context::RequestContext) =
 """
     add_cancel_callback!(callback, context::RequestContext)
 
-Call `callback()` when the other side withdraws the request. When it withdrew
-the request already, `callback()` runs at once. A handler that waits for a
-person uses it to stop the wait.
+Call `callback()` when the other side withdraws the request, or when the
+connection ends before the answer. When that happened already, `callback()`
+runs at once. A handler that waits for a person uses it to stop the wait.
+
+The callback runs on the task that reads the connection, or on the task that
+closes it, so it must not wait.
 """
 function add_cancel_callback!(callback, context::RequestContext)
     is_cancelled = lock(context.connection.state_lock) do
@@ -360,12 +382,14 @@ function add_cancel_callback!(callback, context::RequestContext)
     nothing
 end
 
-# Read one message on each line until the other side closes its stream. A line
-# that is not JSON is dropped with a warning that does not quote it.
+# Read one message on each line until the other side closes its stream or the
+# connection closes. A line that is not JSON, and a message that fails, are
+# dropped with a warning that does not quote them.
 function _read_messages(connection::Connection)
     try
         while true
             line = readline(connection.incoming)
+            connection.is_closed && break
             if isempty(line)
                 eof(connection.incoming) && break
                 continue
@@ -373,17 +397,24 @@ function _read_messages(connection::Connection)
             message = try
                 read_json(line)
             catch exception
-                exception isa ArgumentError || rethrow()
+                exception isa InterruptException && rethrow()
                 @warn "The other side of an ACP connection wrote a line that is not JSON."
                 continue
             end
-            message isa Dict{String,Any} && _dispatch_message!(connection, message)
+            message isa Dict{String,Any} || continue
+            try
+                _dispatch_message!(connection, message)
+            catch exception
+                exception isa InterruptException && rethrow()
+                @warn "A message of the other side of an ACP connection failed." exception
+            end
         end
     catch exception
         connection.is_closed || exception isa Base.IOError || exception isa EOFError ||
             @warn "The reader of an ACP connection stopped." exception
     finally
-        _fail_waiting_requests!(connection)
+        lock(() -> connection.is_reader_done = true, connection.state_lock)
+        _end_exchange!(connection)
     end
 end
 
@@ -400,10 +431,14 @@ function _dispatch_message!(connection::Connection, message::Dict{String,Any})
             _receive_notification!(connection, method, params)
         end
     elseif haskey(message, "id")
+        # The one place that delivers an answer takes its request out of the
+        # waiting requests, so no answer comes twice.
         id = message["id"]
-        answer = lock(() -> id isa Integer ? get(connection.waiting_answers, Int(id), nothing) : nothing,
-                      connection.state_lock)
-        answer === nothing || isready(answer) || put!(answer, message)
+        answer = lock(connection.state_lock) do
+            id isa Integer && typemin(Int) <= id <= typemax(Int) ?
+                pop!(connection.waiting_answers, Int(id), nothing) : nothing
+        end
+        answer === nothing || put!(answer, message)
     end
     nothing
 end
@@ -463,26 +498,49 @@ function _answer_request!(connection::Connection, context::RequestContext, param
                 exception isa ArgumentError || rethrow()
                 throw(ProtocolException(INVALID_PARAMS, sprint(showerror, exception)))
             end
-            _write_result(type, answer_request(connection.handler, request, context))
+            _convert_result_to_json(type, answer_request(connection.handler, request, context))
         end
         Dict{String,Any}("jsonrpc" => "2.0", "id" => context.id, "result" => convert_to_json(result))
     catch exception
-        failure = exception isa ProtocolException ? exception :
-                  ProtocolException(INTERNAL_ERROR, "The answer to `$(method)` failed.")
         exception isa ProtocolException ||
             @warn "The handler of an ACP connection failed to answer a request." method exception
-        error_ = Dict{String,Any}("code" => failure.code, "message" => failure.message)
-        failure.data === nothing || (error_["data"] = convert_to_json(failure.data))
-        Dict{String,Any}("jsonrpc" => "2.0", "id" => context.id, "error" => error_)
+        _make_error_answer(context, exception)
     finally
         lock(() -> delete!(connection.answering, context.id), connection.state_lock)
     end
+    # The text of the answer is made here, so a value without a JSON form, such
+    # as `NaN`, still gives the other side an answer.
+    text = try
+        JSON.json(answer)
+    catch exception
+        @warn "The answer to a request of an ACP connection has no JSON form." method exception
+        JSON.json(_make_error_answer(context, ErrorException("")))
+    end
     try
-        connection.is_closed || _write_message!(connection, answer)
+        connection.is_closed || _write_line!(connection, text)
     catch exception
         exception isa ProtocolException || exception isa Base.IOError || rethrow()
     end
     nothing
+end
+
+# The error answer of a request: the code and the message of a
+# `ProtocolException`, with its data when the data has a JSON form, and
+# `INTERNAL_ERROR` with a message that does not quote any other exception.
+function _make_error_answer(context::RequestContext, exception)
+    failure = exception isa ProtocolException ? exception :
+              ProtocolException(INTERNAL_ERROR, "The answer to `$(context.method)` failed.")
+    error_object = Dict{String,Any}("code" => failure.code, "message" => failure.message)
+    if failure.data !== nothing
+        try
+            data = convert_to_json(failure.data)
+            JSON.json(data)
+            error_object["data"] = data
+        catch exception
+            @warn "The data of an error answer has no JSON form, so the answer goes without it." exception
+        end
+    end
+    Dict{String,Any}("jsonrpc" => "2.0", "id" => context.id, "error" => error_object)
 end
 
 # Whether the handler has a method of `answer_request` for a request of the type
@@ -493,8 +551,8 @@ _is_request_served(handler, ::Type{T}) where {T} =
 
 # The result of a request of the protocol: an empty object when the handler
 # gives `nothing` for a response type that is an object.
-function _write_result(type::Type, result)
+function _convert_result_to_json(type::Type, result)
     response_type = get_response_type(type)
     result === nothing && response_type <: ProtocolObject && return Dict{String,Any}()
-    _write_member(response_type, result)
+    _convert_member_to_json(response_type, result)
 end

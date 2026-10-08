@@ -325,6 +325,26 @@ end
 const METHOD_OF_TYPE = Dict(method.request => method for method in METHODS)
 const METHOD_OF_RESPONSE = Dict(method.response => method for method in METHODS if method.response !== nothing)
 
+# A message goes out as the JSON object of its type, so a type that is also a
+# reused variant of a union, which gets its tag only in a field of the union,
+# can not be the type of a message.
+for method in METHODS, name in (method.request, method.response)
+    name !== nothing && haskey(REUSED_VARIANT_UNIONS, name) &&
+        error("The message type $(name) of `$(method.name)` is a reused variant of $(REUSED_VARIANT_UNIONS[name]).")
+end
+
+# A structural union takes the first variant whose required fields the object
+# has, so a variant whose required fields are all required by a later variant
+# would hide that variant.
+for form in values(UNION_FORMS)
+    FORMS[form.name] === :structural || continue
+    keys_of(variant) = Set(field.key for field in variant.fields if field.is_required)
+    for (index, variant) in enumerate(form.variants), later in form.variants[index + 1:end]
+        issubset(keys_of(variant), keys_of(later)) &&
+            error("In $(form.name), the variant $(variant.name) hides the variant $(later.name).")
+    end
+end
+
 # --- Text --------------------------------------------------------------------
 
 escape_doc(text) = (occursin("\"\"\"", text) && error("A description holds three quotes.");
@@ -399,7 +419,7 @@ function write_view_methods(io, name, fields; tag_key = nothing, tag = nothing)
     tag === nothing || println(io, "    json[$(repr(tag_key))] = $(repr(tag))")
     for field in fields
         if field.is_required
-            println(io, "    json[$(repr(field.key))] = _write_member($(get_julia_type(field.schema)), $(field.name))")
+            println(io, "    json[$(repr(field.key))] = _convert_member_to_json($(get_julia_type(field.schema)), $(field.name))")
         else
             println(io, "    _write_optional!(json, $(repr(field.key)), $(get_julia_type(field.schema)), $(field.name))")
         end

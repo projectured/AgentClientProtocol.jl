@@ -51,8 +51,12 @@ ACP.answer_request(::TestAgent, request::ACP.LoadSessionRequest, context) =
 ACP.answer_request(::TestAgent, request::ACP.ResumeSessionRequest, context) =
     error("a secret that must not reach the other side")
 
-ACP.answer_request(::TestAgent, method::String, params, context) =
-    method == "_test/echo" ? params : throw(ProtocolException(ACP.METHOD_NOT_FOUND, "No `$(method)` here."))
+function ACP.answer_request(::TestAgent, method::String, params, context)
+    method == "_test/echo" && return params
+    method == "_test/nan" && return Dict("value" => NaN)
+    method == "_test/nan-data" && throw(ProtocolException(-32000, "Bad."; data = Dict("value" => NaN)))
+    throw(ProtocolException(ACP.METHOD_NOT_FOUND, "No `$(method)` here."))
+end
 
 ACP.receive_notification(agent::TestAgent, notification::ACP.CancelNotification, connection) =
     put!(agent.notifications, notification)
@@ -187,6 +191,8 @@ end
         answer = wait_for_answer(request; timeout = 10)
         @test answer.outcome isa ACP.RequestPermissionOutcomeCancelled
         @test is_request_cancelled(context)
+        # The client keeps nothing of a request that it answered.
+        @test isempty(client.answering)
         # A callback added after the cancel runs at once.
         ran = Ref(false)
         add_cancel_callback!(() -> ran[] = true, context)
@@ -200,8 +206,12 @@ end
         request = start_request!(agent, ACP.RequestPermissionRequest(
             session_id = "s", tool_call = ACP.ToolCallUpdate(tool_call_id = "t"),
             options = [ACP.PermissionOption(option_id = "allow", name = "Allow", kind = "allow_once")]))
-        take!(client_handler.contexts)
+        context = take!(client_handler.contexts)
         @test_throws ErrorException wait_for_answer(request; timeout = 0.2)
+        # After a timeout the request stays open, and a later wait gets the answer.
+        put!(client_handler.person, "allow")
+        @test wait_for_answer(request; timeout = 10).outcome.option_id == "allow"
+        @test wait_for_answer(request; timeout = 10).outcome.option_id == "allow"
         close_connection!(client)
         close_connection!(agent)
     end
@@ -216,7 +226,66 @@ end
         close_connection!(client)
         @test_throws ProtocolException wait_for_answer(request; timeout = 10)
         @test_throws ProtocolException send_request!(client, ACP.InitializeRequest(protocol_version = 1))
-        put!(client_handler.person, nothing)
+        # The close withdraws the request that the client still answers, so the
+        # wait of its handler ends.
+        @test is_request_cancelled(context)
+        # The agent can send no request after the end of its stream, and its wait ends.
+        @test timedwait(() -> !is_connection_open(agent), 10.0) === :ok
+        @test_throws ProtocolException start_request!(agent, "_test/echo", Dict())
+        wait(agent)
+    end
+
+    @testset "a close ends the wait for a connection on streams" begin
+        client, agent = open_connection_pair(TestClient(), TestAgent())
+        close_connection!(agent)
+        waiter = @async wait(agent)
+        @test timedwait(() -> istaskdone(waiter), 10.0) === :ok
+        close_connection!(client)
+    end
+
+    @testset "an answer without a JSON form still answers" begin
+        client, agent = open_connection_pair(TestClient(), TestAgent())
+        @test_logs (:warn, r"no JSON form") match_mode = :any begin
+            logged_client, logged_agent = open_connection_pair(TestClient(), TestAgent())
+            failure = try
+                send_request!(logged_client, "_test/nan", Dict(); timeout = 10)
+            catch exception
+                exception
+            end
+            @test failure isa ProtocolException && failure.code == ACP.INTERNAL_ERROR
+            without_data = try
+                send_request!(logged_client, "_test/nan-data", Dict(); timeout = 10)
+            catch exception
+                exception
+            end
+            @test (without_data.code, without_data.message, without_data.data) == (-32000, "Bad.", nothing)
+            close_connection!(logged_client)
+        end
+        close_connection!(client)
+    end
+
+    @testset "an answer with an id out of range does not stop the reader" begin
+        to_client = Base.BufferStream()
+        to_agent = Base.BufferStream()
+        client = open_connection(TestClient(), to_client, to_agent)
+        agent = open_connection(TestAgent(), to_agent, to_client)
+        write(to_client, "{\"jsonrpc\":\"2.0\",\"id\":99999999999999999999,\"result\":{}}\n")
+        @test send_request!(client, "_test/echo", Dict("c" => 1); timeout = 10) == Dict{String,Any}("c" => 1)
+        close_connection!(client)
+    end
+
+    @testset "a result null of an object type reads as an empty object" begin
+        to_client = Base.BufferStream()
+        to_agent = Base.BufferStream()
+        client = open_connection(TestClient(), to_client, to_agent)
+        request = start_request!(client, ACP.CloseSessionRequest(session_id = "s"))
+        sent = read_json(readline(to_agent))
+        write(to_client, write_json(Dict("jsonrpc" => "2.0", "id" => sent["id"], "result" => nothing)), "\n")
+        @test wait_for_answer(request; timeout = 10) == ACP.CloseSessionResponse()
+        # A notification without parameters has no field `params`.
+        send_notification!(client, "_test/bare", nothing)
+        @test !haskey(read_json(readline(to_agent)), "params")
+        close_connection!(client)
     end
 
     @testset "a line that is not JSON is dropped, and the next message comes" begin
